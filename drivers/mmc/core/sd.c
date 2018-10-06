@@ -1477,6 +1477,7 @@ err:
 
 	pr_err("%s: error %d whilst initialising SD card\n",
 		mmc_hostname(host), err);
+	printk ("BBox::UEC; 43::3\n");
 
 	return err;
 }
