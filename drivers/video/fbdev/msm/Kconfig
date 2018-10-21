@@ -1,5 +1,8 @@
 source "drivers/video/fbdev/msm/msm_dba/Kconfig"
 
+# SW4-HL-Display-GlanceMode-00+_20170524
+source "drivers/video/fbdev/msm/fih/Kconfig"
+
 if FB_MSM
 
 config FB_MSM_MDSS_COMMON

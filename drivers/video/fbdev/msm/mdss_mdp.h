@@ -57,7 +57,7 @@
 #define C0_G_Y		0	/* G/luma */
 
 /* wait for at most 2 vsync for lowest refresh rate (24hz) */
-#define KOFF_TIMEOUT_MS 84
+#define KOFF_TIMEOUT_MS 200	//Orig - 84	//SW4-HL-Display-GlanceMode-00*_20170524
 #define KOFF_TIMEOUT msecs_to_jiffies(KOFF_TIMEOUT_MS)
 
 #define OVERFETCH_DISABLE_TOP		BIT(0)
@@ -1935,6 +1935,7 @@ void mdss_mdp_data_calc_offset(struct mdss_mdp_data *data, u16 x, u16 y,
 	struct mdss_mdp_plane_sizes *ps, struct mdss_mdp_format_params *fmt);
 void mdss_mdp_format_flag_removal(u32 *table, u32 num, u32 remove_bits);
 struct mdss_mdp_format_params *mdss_mdp_get_format_params(u32 format);
+int mdss_mdp_get_ubwc_micro_dim(u32 format, u16 *w, u16 *h);
 int mdss_mdp_validate_offset_for_ubwc_format(
 	struct mdss_mdp_format_params *fmt, u16 x, u16 y);
 void mdss_mdp_get_v_h_subsample_rate(u8 chroma_samp,
