@@ -86,12 +86,13 @@ static int msm_digcdc_clock_control(bool flag)
 	if (flag) {
 		mutex_lock(&pdata->cdc_int_mclk0_mutex);
 		if (atomic_read(&pdata->int_mclk0_enabled) == false) {
-			if (pdata->native_clk_set)
-				pdata->digital_cdc_core_clk.clk_freq_in_hz =
-							NATIVE_MCLK_RATE;
-			else
-				pdata->digital_cdc_core_clk.clk_freq_in_hz =
-							DEFAULT_MCLK_RATE;
+      if (pdata->native_clk_set)
+              pdata->digital_cdc_core_clk.clk_freq_in_hz =
+                                    NATIVE_MCLK_RATE;
+      else
+              pdata->digital_cdc_core_clk.clk_freq_in_hz =
+                                     DEFAULT_MCLK_RATE;
+
 			pdata->digital_cdc_core_clk.enable = 1;
 			ret = afe_set_lpass_clock_v2(
 						AFE_PORT_ID_INT0_MI2S_RX,
@@ -1401,6 +1402,10 @@ static const struct snd_soc_dapm_route audio_dig_map[] = {
 	{"RX2 MIX1 INP2", "RX3", "I2S RX3"},
 	{"RX2 MIX1 INP2", "IIR1", "IIR1"},
 	{"RX2 MIX1 INP2", "IIR2", "IIR2"},
+  {"RX2 MIX1 INP3", "RX1", "I2S RX1"},
+  {"RX2 MIX1 INP3", "RX2", "I2S RX2"},
+  {"RX2 MIX1 INP3", "RX3", "I2S RX3"},
+
 
 	{"RX3 MIX1 INP1", "RX1", "I2S RX1"},
 	{"RX3 MIX1 INP1", "RX2", "I2S RX2"},
@@ -1412,6 +1417,10 @@ static const struct snd_soc_dapm_route audio_dig_map[] = {
 	{"RX3 MIX1 INP2", "RX3", "I2S RX3"},
 	{"RX3 MIX1 INP2", "IIR1", "IIR1"},
 	{"RX3 MIX1 INP2", "IIR2", "IIR2"},
+  {"RX3 MIX1 INP3", "RX1", "I2S RX1"},
+  {"RX3 MIX1 INP3", "RX2", "I2S RX2"},
+  {"RX3 MIX1 INP3", "RX3", "I2S RX3"},
+
 
 	{"RX1 MIX2 INP1", "IIR1", "IIR1"},
 	{"RX2 MIX2 INP1", "IIR1", "IIR1"},

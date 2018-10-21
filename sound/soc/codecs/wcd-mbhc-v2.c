@@ -60,12 +60,54 @@ module_param(det_extn_cable_en, int,
 		S_IRUGO | S_IWUSR | S_IWGRP);
 MODULE_PARM_DESC(det_extn_cable_en, "enable/disable extn cable detect");
 
+//2015.3.12, Add switch device for FTM request FAO-4
+#define LEGACY_SWITCH_DEV_SUPPORT
+#ifdef LEGACY_SWITCH_DEV_SUPPORT
+#include <linux/switch.h>
+#include <asm/atomic.h>
+
+struct h2w_info {
+	struct switch_dev sdev;
+	atomic_t btn_state;
+	atomic_t hs_state;
+};
+static struct h2w_info *fih_hs;
+
+static ssize_t trout_h2w_print_name(struct switch_dev *sdev, char *buf)
+{
+       int state = 0;
+       state = switch_get_state(&fih_hs->sdev);
+
+	switch (state) 
+	{
+		case MBHC_PLUG_TYPE_NONE:
+			return sprintf(buf, "No Device\n");
+		case MBHC_PLUG_TYPE_HEADSET:         
+			return sprintf(buf, "Headset\n");
+		case MBHC_PLUG_TYPE_HEADPHONE: 
+			return sprintf(buf, "Headphone\n");
+	}
+
+	return -EINVAL;
+}
+static ssize_t show_btn_state(struct device *dev,struct device_attribute *attr, char *buf)
+{
+	unsigned char btn_state;
+	btn_state = atomic_read(&fih_hs->btn_state);
+	return sprintf(buf, "%u\n", btn_state);
+}
+static DEVICE_ATTR(btn_state, S_IRUGO, show_btn_state, NULL);
+#endif
+
 enum wcd_mbhc_cs_mb_en_flag {
 	WCD_MBHC_EN_CS = 0,
 	WCD_MBHC_EN_MB,
 	WCD_MBHC_EN_PULLUP,
 	WCD_MBHC_EN_NONE,
 };
+
+static void wcd_enable_mbhc_supply(struct wcd_mbhc *mbhc,
+			enum wcd_mbhc_plug_type plug_type);
 
 static void wcd_mbhc_jack_report(struct wcd_mbhc *mbhc,
 				struct snd_soc_jack *jack, int status, int mask)
@@ -649,6 +691,9 @@ static void wcd_mbhc_report_plug(struct wcd_mbhc *mbhc, int insertion,
 
 		mbhc->hph_type = WCD_MBHC_HPH_NONE;
 		mbhc->zl = mbhc->zr = 0;
+		//Add prevent portable speaker detection abnormal -- st.
+		mbhc->force_linein = false;
+		//Add prevent portable speaker detection abnormal -- ed.
 		pr_debug("%s: Reporting removal %d(%x)\n", __func__,
 			 jack_type, mbhc->hph_status);
 		wcd_mbhc_jack_report(mbhc, &mbhc->headset_jack,
@@ -693,6 +738,10 @@ static void wcd_mbhc_report_plug(struct wcd_mbhc *mbhc, int insertion,
 				 __func__, mbhc->hph_status);
 			wcd_mbhc_jack_report(mbhc, &mbhc->headset_jack,
 					    0, WCD_MBHC_JACK_MASK);
+
+      //Add prevent portable speaker detection abnormal -- st.
+      mbhc->force_linein = false; 
+      //Add prevent portable speaker detection abnormal -- ed.
 
 			if (mbhc->hph_status == SND_JACK_LINEOUT) {
 
@@ -750,6 +799,9 @@ static void wcd_mbhc_report_plug(struct wcd_mbhc *mbhc, int insertion,
 				jack_type = SND_JACK_LINEOUT;
 				mbhc->force_linein = true;
 				mbhc->current_plug = MBHC_PLUG_TYPE_HIGH_HPH;
+				//Add prevent portable speaker detection abnormal -- st.
+				mbhc->force_linein = true; 
+				//Add prevent portable speaker detection abnormal -- ed.
 				if (mbhc->hph_status) {
 					mbhc->hph_status &= ~(SND_JACK_HEADSET |
 							SND_JACK_LINEOUT |
@@ -773,6 +825,16 @@ static void wcd_mbhc_report_plug(struct wcd_mbhc *mbhc, int insertion,
 				    WCD_MBHC_JACK_MASK);
 		wcd_mbhc_clr_and_turnon_hph_padac(mbhc);
 	}
+
+//Add switch device for FTM request FAO-4
+#ifdef LEGACY_SWITCH_DEV_SUPPORT
+		if(!mbhc->mbhc_cfg->fih_hs_support && fih_hs)
+		{
+			switch_set_state(&fih_hs->sdev, mbhc->current_plug);
+			pr_info("%s: switch_set_state %d\n", __func__, mbhc->current_plug);
+		}
+#endif
+
 	pr_debug("%s: leave hph_status %x\n", __func__, mbhc->hph_status);
 }
 
@@ -890,7 +952,30 @@ static void wcd_mbhc_find_plug_and_report(struct wcd_mbhc *mbhc,
 						SND_JACK_HEADPHONE);
 			if (mbhc->current_plug == MBHC_PLUG_TYPE_HEADSET)
 				wcd_mbhc_report_plug(mbhc, 0, SND_JACK_HEADSET);
-		wcd_mbhc_report_plug(mbhc, 1, SND_JACK_UNSUPPORTED);
+		//wcd_mbhc_report_plug(mbhc, 1, SND_JACK_UNSUPPORTED);
+			/* 
+			* calculate impedance detection 
+			* If Zl and Zr > 20k then it is special accessory 
+			* otherwise unsupported cable. 
+			*/ 
+			pr_debug("%s: plug_type == MBHC_PLUG_TYPE_GND_MIC_SWAP \n", __func__); 
+			if (mbhc->impedance_detect && mbhc->mbhc_cb->compute_impedance) { 
+				mbhc->mbhc_cb->compute_impedance(mbhc, &mbhc->zl, &mbhc->zr); 
+				if ((mbhc->zl > 20000) && (mbhc->zr > 20000)) { 
+					pr_debug("%s: special accessory \n", __func__); 
+					/* Toggle switch back */ 
+					if (mbhc->mbhc_cfg->swap_gnd_mic && 
+						mbhc->mbhc_cfg->swap_gnd_mic(mbhc->codec)) { 
+						pr_debug("%s: US_EU gpio present,flip switch again\n" , __func__); 
+					} 
+					/* enable CS/MICBIAS for headset button detection to work */ 
+					wcd_enable_mbhc_supply(mbhc, MBHC_PLUG_TYPE_HEADSET); 
+					wcd_mbhc_report_plug(mbhc, 1, SND_JACK_HEADSET); 
+				} 
+				else { 
+					wcd_mbhc_report_plug(mbhc, 1, SND_JACK_UNSUPPORTED); 
+				} 
+			} 
 	} else if (plug_type == MBHC_PLUG_TYPE_HEADSET) {
 		if (mbhc->mbhc_cfg->enable_anc_mic_detect)
 			anc_mic_found = wcd_mbhc_detect_anc_plug_type(mbhc);
@@ -926,7 +1011,26 @@ static void wcd_mbhc_find_plug_and_report(struct wcd_mbhc *mbhc,
 			wcd_mbhc_hs_elec_irq(mbhc, WCD_MBHC_ELEC_HS_INS,
 					     true);
 		} else {
-			wcd_mbhc_report_plug(mbhc, 1, SND_JACK_LINEOUT);
+			/* 
+			* calculate impedance detection 
+			* If Zl and Zr > 20k then it is special accessory 
+			* otherwise unsupported cable. 
+			*/ 
+			if (mbhc->impedance_detect && mbhc->mbhc_cb->compute_impedance) { 
+				mbhc->mbhc_cb->compute_impedance(mbhc, &mbhc->zl, &mbhc->zr); 
+				if ((mbhc->zl > 20000) && (mbhc->zr > 20000)) { 
+					pr_debug("%s: special accessory \n", __func__); 
+					/* Toggle switch back */ 
+					if (mbhc->mbhc_cfg->swap_gnd_mic && 
+						mbhc->mbhc_cfg->swap_gnd_mic(mbhc->codec)) { 
+						pr_debug("%s: US_EU gpio present,flip switch again\n" , __func__); 
+					} 
+
+					wcd_mbhc_report_plug(mbhc, 1, SND_JACK_HEADSET); 
+				} 
+				else		
+					wcd_mbhc_report_plug(mbhc, 1, SND_JACK_LINEOUT);
+			}
 		}
 	} else {
 		WARN(1, "Unexpected current plug_type %d, plug_type %d\n",
@@ -939,55 +1043,56 @@ exit:
 /* To determine if cross connection occured */
 static int wcd_check_cross_conn(struct wcd_mbhc *mbhc)
 {
-	u16 swap_res = 0;
-	enum wcd_mbhc_plug_type plug_type = MBHC_PLUG_TYPE_NONE;
-	s16 reg1 = 0;
-	bool hphl_sch_res = 0, hphr_sch_res = 0;
-
-	if (wcd_swch_level_remove(mbhc)) {
-		pr_debug("%s: Switch level is low\n", __func__);
-		return -EINVAL;
-	}
-
-	/* If PA is enabled, dont check for cross-connection */
-	if (mbhc->mbhc_cb->hph_pa_on_status)
-		if (mbhc->mbhc_cb->hph_pa_on_status(mbhc->codec))
-			return false;
-
-	WCD_MBHC_REG_READ(WCD_MBHC_ELECT_SCHMT_ISRC, reg1);
-	/*
-	 * Check if there is any cross connection,
-	 * Micbias and schmitt trigger (HPHL-HPHR)
-	 * needs to be enabled. For some codecs like wcd9335,
-	 * pull-up will already be enabled when this function
-	 * is called for cross-connection identification. No
-	 * need to enable micbias in that case.
-	 */
-	wcd_enable_curr_micbias(mbhc, WCD_MBHC_EN_MB);
-	WCD_MBHC_REG_UPDATE_BITS(WCD_MBHC_ELECT_SCHMT_ISRC, 2);
-
-	WCD_MBHC_REG_READ(WCD_MBHC_ELECT_RESULT, swap_res);
-	pr_debug("%s: swap_res%x\n", __func__, swap_res);
-
-	/*
-	 * Read reg hphl and hphr schmitt result with cross connection
-	 * bit. These bits will both be "0" in case of cross connection
-	 * otherwise, they stay at 1
-	 */
-	WCD_MBHC_REG_READ(WCD_MBHC_HPHL_SCHMT_RESULT, hphl_sch_res);
-	WCD_MBHC_REG_READ(WCD_MBHC_HPHR_SCHMT_RESULT, hphr_sch_res);
-	if (!(hphl_sch_res || hphr_sch_res)) {
-		plug_type = MBHC_PLUG_TYPE_GND_MIC_SWAP;
-		pr_debug("%s: Cross connection identified\n", __func__);
-	} else {
-		pr_debug("%s: No Cross connection found\n", __func__);
-	}
-
-	/* Disable schmitt trigger and restore micbias */
-	WCD_MBHC_REG_UPDATE_BITS(WCD_MBHC_ELECT_SCHMT_ISRC, reg1);
-	pr_debug("%s: leave, plug type: %d\n", __func__,  plug_type);
-
-	return (plug_type == MBHC_PLUG_TYPE_GND_MIC_SWAP) ? true : false;
+    return false;
+//	u16 swap_res = 0;
+//	enum wcd_mbhc_plug_type plug_type = MBHC_PLUG_TYPE_NONE;
+//	s16 reg1 = 0;
+//	bool hphl_sch_res = 0, hphr_sch_res = 0;
+//
+//	if (wcd_swch_level_remove(mbhc)) {
+//		pr_debug("%s: Switch level is low\n", __func__);
+//		return -EINVAL;
+//	}
+//
+//	/* If PA is enabled, dont check for cross-connection */
+//	if (mbhc->mbhc_cb->hph_pa_on_status)
+//		if (mbhc->mbhc_cb->hph_pa_on_status(mbhc->codec))
+//			return false;
+//
+//	WCD_MBHC_REG_READ(WCD_MBHC_ELECT_SCHMT_ISRC, reg1);
+//	/*
+//	 * Check if there is any cross connection,
+//	 * Micbias and schmitt trigger (HPHL-HPHR)
+//	 * needs to be enabled. For some codecs like wcd9335,
+//	 * pull-up will already be enabled when this function
+//	 * is called for cross-connection identification. No
+//	 * need to enable micbias in that case.
+//	 */
+//	wcd_enable_curr_micbias(mbhc, WCD_MBHC_EN_MB);
+//	WCD_MBHC_REG_UPDATE_BITS(WCD_MBHC_ELECT_SCHMT_ISRC, 2);
+//
+//	WCD_MBHC_REG_READ(WCD_MBHC_ELECT_RESULT, swap_res);
+//	pr_debug("%s: swap_res%x\n", __func__, swap_res);
+//
+//	/*
+//	 * Read reg hphl and hphr schmitt result with cross connection
+//	 * bit. These bits will both be "0" in case of cross connection
+//	 * otherwise, they stay at 1
+//	 */
+//	WCD_MBHC_REG_READ(WCD_MBHC_HPHL_SCHMT_RESULT, hphl_sch_res);
+//	WCD_MBHC_REG_READ(WCD_MBHC_HPHR_SCHMT_RESULT, hphr_sch_res);
+//	if (!(hphl_sch_res || hphr_sch_res)) {
+//		plug_type = MBHC_PLUG_TYPE_GND_MIC_SWAP;
+//		pr_debug("%s: Cross connection identified\n", __func__);
+//	} else {
+//		pr_debug("%s: No Cross connection found\n", __func__);
+//	}
+//
+//	/* Disable schmitt trigger and restore micbias */
+//	WCD_MBHC_REG_UPDATE_BITS(WCD_MBHC_ELECT_SCHMT_ISRC, reg1);
+//	pr_debug("%s: leave, plug type: %d\n", __func__,  plug_type);
+//
+//	return (plug_type == MBHC_PLUG_TYPE_GND_MIC_SWAP) ? true : false;
 }
 
 static bool wcd_is_special_headset(struct wcd_mbhc *mbhc)
@@ -1442,6 +1547,14 @@ correct_plug_type:
 	if (!wrk_complete && mbhc->btn_press_intr) {
 		pr_debug("%s: Can be slow insertion of headphone\n", __func__);
 		wcd_cancel_btn_work(mbhc);
+
+    //Add prevent portable speaker detection abnormal -- st.
+			if (mbhc->force_linein) { 
+     	    plug_type = MBHC_PLUG_TYPE_HIGH_HPH; 
+     	    goto exit; 
+     	} 
+    //Add prevent portable speaker detection abnormal -- ed.
+
 		/* Report as headphone only if previously
 		 * not reported as lineout
 		 */
@@ -1489,7 +1602,7 @@ enable_supply:
 	if (mbhc->mbhc_cb->mbhc_micbias_control)
 		wcd_mbhc_update_fsm_source(mbhc, plug_type);
 	else
-		wcd_enable_mbhc_supply(mbhc, plug_type);
+		wcd_enable_mbhc_supply(mbhc, mbhc->current_plug);
 exit:
 	if (mbhc->mbhc_cb->mbhc_micbias_control &&
 	    !mbhc->micbias_enable)
@@ -1973,6 +2086,15 @@ static void wcd_btn_lpress_fn(struct work_struct *work)
 		wcd_mbhc_jack_report(mbhc, &mbhc->button_jack,
 				mbhc->buttons_pressed, mbhc->buttons_pressed);
 	}
+//Add switch device for FTM request FAO-4
+#ifdef LEGACY_SWITCH_DEV_SUPPORT
+		if(!mbhc->mbhc_cfg->fih_hs_support && fih_hs)
+		{
+			atomic_set(&fih_hs->btn_state, 1); 
+			pr_info("%s: switch_set_btn_state press(0x%x)\n", __func__, mbhc->buttons_pressed);
+		}
+#endif
+
 	pr_debug("%s: leave\n", __func__);
 	mbhc->mbhc_cb->lock_sleep(mbhc, false);
 }
@@ -2088,6 +2210,14 @@ static irqreturn_t wcd_mbhc_release_handler(int irq, void *data)
 				 __func__);
 			wcd_mbhc_jack_report(mbhc, &mbhc->button_jack,
 					0, mbhc->buttons_pressed);
+//Add switch device for FTM request FAO-4
+#ifdef LEGACY_SWITCH_DEV_SUPPORT
+			if(!mbhc->mbhc_cfg->fih_hs_support && fih_hs)
+			{
+				atomic_set(&fih_hs->btn_state, 0); 
+				pr_info("%s: switch_set_btn_state release\n", __func__);
+			}
+#endif
 		} else {
 			if (mbhc->in_swch_irq_handler) {
 				pr_debug("%s: Switch irq kicked in, ignore\n",
@@ -2099,11 +2229,27 @@ static irqreturn_t wcd_mbhc_release_handler(int irq, void *data)
 						     &mbhc->button_jack,
 						     mbhc->buttons_pressed,
 						     mbhc->buttons_pressed);
+//Add switch device for FTM request FAO-4
+#ifdef LEGACY_SWITCH_DEV_SUPPORT
+				if(!mbhc->mbhc_cfg->fih_hs_support && fih_hs)
+				{
+					atomic_set(&fih_hs->btn_state, 1); 
+					pr_info("%s: switch_set_btn_state press(0x%x)\n", __func__, mbhc->buttons_pressed);
+				}
+#endif
 				pr_debug("%s: Reporting btn release\n",
 					 __func__);
 				wcd_mbhc_jack_report(mbhc,
 						&mbhc->button_jack,
 						0, mbhc->buttons_pressed);
+//Add switch device for FTM request FAO-4
+#ifdef LEGACY_SWITCH_DEV_SUPPORT
+				if(!mbhc->mbhc_cfg->fih_hs_support && fih_hs)
+				{
+					atomic_set(&fih_hs->btn_state, 0); 
+					pr_info("%s: switch_set_btn_state release\n", __func__);
+				}
+#endif
 			}
 		}
 		mbhc->buttons_pressed &= ~WCD_MBHC_JACK_BUTTON_MASK;
@@ -2693,6 +2839,44 @@ int wcd_mbhc_start(struct wcd_mbhc *mbhc, struct wcd_mbhc_config *mbhc_cfg)
 			pr_err("%s: Skipping to read mbhc fw, 0x%pK %pK\n",
 				 __func__, mbhc->mbhc_fw, mbhc->mbhc_cal);
 	}
+//Add switch device for FTM request FAO-4
+#ifdef LEGACY_SWITCH_DEV_SUPPORT
+	/*Modify this function for MCS-4331 kernel_panic issue*/
+	if(!mbhc->mbhc_cfg->fih_hs_support)
+	{
+		int ret;
+		if (!fih_hs){
+			pr_info("%s: kzalloc fih_hs\n", __func__);
+			fih_hs = kzalloc(sizeof(struct h2w_info), GFP_KERNEL);
+			if (!fih_hs)
+				return -ENOMEM;
+			// /sys/class/switch/h2w/state to be updated.
+			// /sys/class/switch/h2w/btn_state to be updated.
+			atomic_set(&fih_hs->btn_state, 0);
+			atomic_set(&fih_hs->hs_state, 0);
+			fih_hs->sdev.name = "h2w";
+			fih_hs->sdev.print_name = trout_h2w_print_name;
+			ret = switch_dev_register(&fih_hs->sdev);
+			if (!ret){
+				ret = device_create_file(fih_hs->sdev.dev,&dev_attr_btn_state);
+				if(ret)
+				{
+					pr_err("%s: device_create_file btn_state fail %d!\n", __func__, ret);
+					switch_dev_unregister(&fih_hs->sdev);
+					kzfree(fih_hs);
+				}
+			}
+			else	{
+				pr_err("%s: switch_dev_register (%s) fail %d\n", __func__, fih_hs->sdev.name, ret);
+				kzfree(fih_hs);
+			}
+		}
+		else	{
+			pr_err("%s: fih_hs already exist with name(%s)\n", __func__, fih_hs->sdev.name);
+		}
+	}
+#endif
+	pr_debug("%s: leave %d\n", __func__, rc);
 
 	return rc;
 err:
