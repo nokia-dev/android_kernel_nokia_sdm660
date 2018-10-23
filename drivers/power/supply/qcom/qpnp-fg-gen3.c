@@ -160,6 +160,9 @@ static void fg_encode_default(struct fg_sram_param *sp,
 	enum fg_sram_param_id id, int val, u8 *buf);
 
 static struct fg_irq_info fg_irqs[FG_IRQ_MAX];
+#ifdef BBS_LOG
+static int fg_get_cycle_count(struct fg_chip *chip);
+#endif
 
 #define PARAM(_id, _addr_word, _addr_byte, _len, _num, _den, _offset,	\
 	      _enc, _dec)						\
@@ -401,7 +404,6 @@ module_param_named(
 
 static int fg_restart;
 static bool fg_sram_dump;
-
 /* All getters HERE */
 
 #define VOLTAGE_15BIT_MASK	GENMASK(14, 0)
@@ -712,7 +714,19 @@ static int fg_get_msoc(struct fg_chip *chip, int *msoc)
 	if (rc < 0)
 		return rc;
 
-	*msoc = DIV_ROUND_CLOSEST(*msoc * FULL_CAPACITY, FULL_SOC_RAW);
+	/*
+	 * To have better endpoints for 0 and 100, it is good to tune the
+	 * calculation discarding values 0 and 255 while rounding off. Rest
+	 * of the values 1-254 will be scaled to 1-99. DIV_ROUND_UP will not
+	 * be suitable here as it rounds up any value higher than 252 to 100.
+	 */
+	if (*msoc == FULL_SOC_RAW)
+		*msoc = 100;
+	else if (*msoc == 0)
+		*msoc = 0;
+	else
+		*msoc = DIV_ROUND_CLOSEST((*msoc - 1) * (FULL_CAPACITY - 2),
+				FULL_SOC_RAW - 2) + 1;
 	return 0;
 }
 
@@ -741,6 +755,11 @@ static bool is_batt_empty(struct fg_chip *chip)
 	if (!rc)
 		pr_warn("batt_soc_rt_sts: %x vbatt: %d uV msoc:%d\n", status,
 			vbatt_uv, msoc);
+
+	#ifdef BBS_LOG
+	if(vbatt_uv < chip->dt.cutoff_volt_mv * 1000)
+		QPNPFG_BATTERY_VOLTAGE_LOW;
+	#endif
 
 	return ((vbatt_uv < chip->dt.cutoff_volt_mv * 1000) ? true : false);
 }
@@ -916,6 +935,10 @@ static int fg_get_batt_profile(struct fg_chip *chip)
 	struct device_node *batt_node, *profile_node;
 	const char *data;
 	int rc, len;
+
+	#ifdef BBS_LOG
+		printk("BBox::UPD;0::%d\n", chip->batt_id_ohms/1000);
+	#endif
 
 	batt_node = of_find_node_by_name(node, "qcom,battery-data");
 	if (!batt_node) {
@@ -1257,6 +1280,7 @@ static int fg_load_learned_cap_from_sram(struct fg_chip *chip)
 {
 	int rc, act_cap_mah;
 	int64_t delta_cc_uah, pct_nom_cap_uah;
+	int aging_cc;
 
 	rc = fg_get_sram_prop(chip, FG_SRAM_ACT_BATT_CAP, &act_cap_mah);
 	if (rc < 0) {
@@ -1292,6 +1316,22 @@ static int fg_load_learned_cap_from_sram(struct fg_chip *chip)
 
 	fg_dbg(chip, FG_CAP_LEARN, "learned_cc_uah:%lld nom_cap_uah: %lld\n",
 		chip->cl.learned_cc_uah, chip->cl.nom_cap_uah);
+
+#ifdef BBS_LOG
+	printk("BBox::UPD;49::%lld\n", (chip->cl.nom_cap_uah)/1000);
+
+	if(chip->cl.learned_cc_uah < chip->cl.nom_cap_uah)
+	{
+		aging_cc = div64_s64((chip->cl.learned_cc_uah*100),
+					chip->cl.nom_cap_uah);
+		if(aging_cc < 70) {
+			printk("BBox::UEC;49::2\n");
+			printk("BBox::UPD;50::%d::%lld\n", fg_get_cycle_count(chip), (chip->cl.learned_cc_uah)/1000);
+		}
+
+	}
+#endif
+
 	return 0;
 }
 
@@ -1936,6 +1976,7 @@ static int fg_adjust_recharge_soc(struct fg_chip *chip)
 
 	recharge_soc = chip->dt.recharge_soc_thr;
 	recharge_soc_status = chip->recharge_soc_adjusted;
+
 	/*
 	 * If the input is present and charging had been terminated, adjust
 	 * the recharge SOC threshold based on the monotonic SOC at which
@@ -2572,7 +2613,8 @@ static bool is_profile_load_required(struct fg_chip *chip)
 		profiles_same = memcmp(chip->batt_profile, buf,
 					PROFILE_COMP_LEN) == 0;
 		if (profiles_same) {
-			fg_dbg(chip, FG_STATUS, "Battery profile is same, not loading it\n");
+			//fg_dbg(chip, FG_STATUS, "Battery profile is same, not loading it\n");
+			pr_err("Battery profile is same, not loading it\n");
 			return false;
 		}
 
@@ -2589,7 +2631,8 @@ static bool is_profile_load_required(struct fg_chip *chip)
 			return false;
 		}
 
-		fg_dbg(chip, FG_STATUS, "Profiles are different, loading the correct one\n");
+		//fg_dbg(chip, FG_STATUS, "Profiles are different, loading the correct one\n");
+		pr_err("Profiles are different, loading the correct one\n");
 	} else {
 		fg_dbg(chip, FG_STATUS, "Profile integrity bit is not set\n");
 		if (fg_profile_dump) {
@@ -2600,6 +2643,50 @@ static bool is_profile_load_required(struct fg_chip *chip)
 	}
 	return true;
 }
+
+static void fg_update_batt_profile(struct fg_chip *chip)
+{
+	int rc, offset;
+	u8 val;
+
+	rc = fg_sram_read(chip, PROFILE_INTEGRITY_WORD,
+			SW_CONFIG_OFFSET, &val, 1, FG_IMA_DEFAULT);
+	if (rc < 0) {
+		pr_err("Error in reading SW_CONFIG_OFFSET, rc=%d\n", rc);
+		return;
+	}
+
+	/*
+	 * If the RCONN had not been updated, no need to update battery
+	 * profile. Else, update the battery profile so that the profile
+	 * modified by bootloader or HLOS matches with the profile read
+	 * from device tree.
+	 */
+
+	if (!(val & RCONN_CONFIG_BIT))
+		return;
+
+	rc = fg_sram_read(chip, ESR_RSLOW_CHG_WORD,
+			ESR_RSLOW_CHG_OFFSET, &val, 1, FG_IMA_DEFAULT);
+	if (rc < 0) {
+		pr_err("Error in reading ESR_RSLOW_CHG_OFFSET, rc=%d\n", rc);
+		return;
+	}
+	offset = (ESR_RSLOW_CHG_WORD - PROFILE_LOAD_WORD) * 4
+			+ ESR_RSLOW_CHG_OFFSET;
+	chip->batt_profile[offset] = val;
+
+	rc = fg_sram_read(chip, ESR_RSLOW_DISCHG_WORD,
+			ESR_RSLOW_DISCHG_OFFSET, &val, 1, FG_IMA_DEFAULT);
+	if (rc < 0) {
+		pr_err("Error in reading ESR_RSLOW_DISCHG_OFFSET, rc=%d\n", rc);
+		return;
+	}
+	offset = (ESR_RSLOW_DISCHG_WORD - PROFILE_LOAD_WORD) * 4
+			+ ESR_RSLOW_DISCHG_OFFSET;
+	chip->batt_profile[offset] = val;
+}
+
 
 static void clear_battery_profile(struct fg_chip *chip)
 {
@@ -2623,6 +2710,10 @@ static int __fg_restart(struct fg_chip *chip)
 		pr_err("Error in getting capacity, rc=%d\n", rc);
 		return rc;
 	}
+
+	#ifdef BBS_LOG
+	printk("BBox::UPD;72::\n");
+	#endif
 
 	chip->last_soc = msoc;
 	chip->fg_restarting = true;
@@ -2684,6 +2775,8 @@ static void profile_load_work(struct work_struct *work)
 	if (!chip->profile_available)
 		goto out;
 
+	fg_update_batt_profile(chip);
+
 	if (!is_profile_load_required(chip))
 		goto done;
 
@@ -2744,6 +2837,10 @@ done:
 			pr_err("Error in loading capacity learning data, rc:%d\n",
 				rc);
 	}
+
+	rc = fg_rconn_config(chip);
+	if (rc < 0)
+		pr_err("Error in configuring Rconn, rc=%d\n", rc);
 
 	batt_psy_initialized(chip);
 	fg_notify_charger(chip);
@@ -3463,6 +3560,9 @@ static int fg_psy_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CC_STEP_SEL:
 		pval->intval = chip->ttf.cc_step.sel;
 		break;
+	case POWER_SUPPLY_PROP_FG_RESET_CLOCK:
+		pval->intval = 0;
+		break;
 	default:
 		pr_err("unsupported property %d\n", psp);
 		rc = -EINVAL;
@@ -3473,6 +3573,108 @@ static int fg_psy_get_property(struct power_supply *psy,
 		return -ENODATA;
 
 	return 0;
+}
+
+#define BCL_RESET_RETRY_COUNT 4
+static int fg_bcl_reset(struct fg_chip *chip)
+{
+	int i, ret, rc = 0;
+	u8 val, peek_mux;
+	bool success = false;
+
+	/* Read initial value of peek mux1 */
+	rc = fg_read(chip, BATT_INFO_PEEK_MUX1(chip), &peek_mux, 1);
+	if (rc < 0) {
+		pr_err("Error in writing peek mux1, rc=%d\n", rc);
+		return rc;
+	}
+
+	val = 0x83;
+	rc = fg_write(chip, BATT_INFO_PEEK_MUX1(chip), &val, 1);
+	if (rc < 0) {
+		pr_err("Error in writing peek mux1, rc=%d\n", rc);
+		return rc;
+	}
+
+	mutex_lock(&chip->sram_rw_lock);
+	for (i = 0; i < BCL_RESET_RETRY_COUNT; i++) {
+		rc = fg_dma_mem_req(chip, true);
+		if (rc < 0) {
+			pr_err("Error in locking memory, rc=%d\n", rc);
+			goto unlock;
+		}
+
+		rc = fg_read(chip, BATT_INFO_RDBACK(chip), &val, 1);
+		if (rc < 0) {
+			pr_err("Error in reading rdback, rc=%d\n", rc);
+			goto release_mem;
+		}
+
+		if (val & PEEK_MUX1_BIT) {
+			rc = fg_masked_write(chip, BATT_SOC_RST_CTRL0(chip),
+						BCL_RESET_BIT, BCL_RESET_BIT);
+			if (rc < 0) {
+				pr_err("Error in writing RST_CTRL0, rc=%d\n",
+						rc);
+				goto release_mem;
+			}
+
+			rc = fg_dma_mem_req(chip, false);
+			if (rc < 0)
+				pr_err("Error in unlocking memory, rc=%d\n", rc);
+
+			/* Delay of 2ms */
+			usleep_range(2000, 3000);
+			ret = fg_masked_write(chip, BATT_SOC_RST_CTRL0(chip),
+						BCL_RESET_BIT, 0);
+			if (ret < 0)
+				pr_err("Error in writing RST_CTRL0, rc=%d\n",
+						rc);
+			if (!rc && !ret)
+				success = true;
+
+			goto unlock;
+		} else {
+			rc = fg_dma_mem_req(chip, false);
+			if (rc < 0) {
+				pr_err("Error in unlocking memory, rc=%d\n", rc);
+				return rc;
+			}
+			success = false;
+			pr_err_ratelimited("PEEK_MUX1 not set retrying...\n");
+			msleep(1000);
+		}
+	}
+
+release_mem:
+	rc = fg_dma_mem_req(chip, false);
+	if (rc < 0)
+		pr_err("Error in unlocking memory, rc=%d\n", rc);
+
+unlock:
+	ret = fg_write(chip, BATT_INFO_PEEK_MUX1(chip), &peek_mux, 1);
+	if (ret < 0) {
+		pr_err("Error in writing peek mux1, rc=%d\n", rc);
+		mutex_unlock(&chip->sram_rw_lock);
+		return ret;
+	}
+
+	mutex_unlock(&chip->sram_rw_lock);
+
+	/*FIH_ZZDC_Code@2018/01/17 John::[PL2O-3267] a QC solution for devices can't be charged degin*/
+	msleep(100);
+	if (fg_get_batt_id(chip) < 0) {
+		pr_err("Error in getting battery id\n");
+	}
+	/*FIH_ZZDC_Code@2018/01/17 John::[PL2O-3267] a QC solution for devices can't be charged end*/
+	if (!success)
+		return -EAGAIN;
+	else
+	{
+		pr_err("BBox;%s: rradc read failed, reset fuel gaugle\n", __func__);
+		printk("BBox::UEC;12::3\n");
+		return rc;
+	}
 }
 
 static int fg_psy_set_property(struct power_supply *psy,
@@ -3519,6 +3721,13 @@ static int fg_psy_set_property(struct power_supply *psy,
 			pr_err("cc_step_sel is out of bounds [0, %d]\n",
 				pval->intval);
 			return -EINVAL;
+		}
+		break;
+	case POWER_SUPPLY_PROP_FG_RESET_CLOCK:
+		rc = fg_bcl_reset(chip);
+		if (rc < 0) {
+			pr_err("Error in resetting BCL clock, rc=%d\n", rc);
+			return rc;
 		}
 		break;
 	default:
@@ -3599,6 +3808,7 @@ static enum power_supply_property fg_psy_props[] = {
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE,
 	POWER_SUPPLY_PROP_CC_STEP,
 	POWER_SUPPLY_PROP_CC_STEP_SEL,
+	POWER_SUPPLY_PROP_FG_RESET_CLOCK,
 };
 
 static const struct power_supply_desc fg_psy_desc = {
@@ -3611,6 +3821,52 @@ static const struct power_supply_desc fg_psy_desc = {
 	.external_power_changed = fg_external_power_changed,
 	.property_is_writeable = fg_property_is_writeable,
 };
+
+// FIHTDC, IdaChiang, add for DRG external sense issue {{
+static ssize_t rsense_sel_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct fg_chip *chip = dev_get_drvdata(dev);
+	u8 sel = 0;
+	int rc;
+
+	rc = fg_read(chip, BATT_INFO_IBATT_SENSING_CFG(chip), &sel, 1);
+	if (rc < 0) {
+		pr_err("failed to read addr=0x%04x, rc=%d\n",
+			BATT_INFO_IBATT_SENSING_CFG(chip), rc);
+	}
+
+	pr_info("rsense_sel_show = %d\n", sel);
+	return sprintf(buf, "%d\n", sel);
+}
+
+static ssize_t rsense_sel_store(struct device *dev,
+		struct device_attribute *attr, const char
+		*buf, size_t size)
+{
+	struct fg_chip *chip = dev_get_drvdata(dev);
+	int intval =0;
+	int rc;
+
+	sscanf(buf, "%d", &intval);
+
+	if(intval !=0 && intval !=1 && intval !=2){
+		pr_info("%s:Invalid argument:%s\n", __func__, buf);
+		return -EINVAL;
+	}
+
+	rc = fg_masked_write(chip, BATT_INFO_IBATT_SENSING_CFG(chip),
+			SOURCE_SELECT_MASK, intval);
+	if (rc < 0) {
+		pr_err("Error in writing rsense_sel, rc=%d\n", rc);
+		return rc;
+	}
+	
+	return size;
+}
+
+static DEVICE_ATTR(rsense_sel, 0644, rsense_sel_show, rsense_sel_store);
+// FIHTDC, IdaChiang, add for DRG external sense issue }}
 
 /* INIT FUNCTIONS STAY HERE */
 
@@ -3829,12 +4085,6 @@ static int fg_hw_init(struct fg_chip *chip)
 		return rc;
 	}
 
-	rc = fg_rconn_config(chip);
-	if (rc < 0) {
-		pr_err("Error in configuring Rconn, rc=%d\n", rc);
-		return rc;
-	}
-
 	fg_encode(chip->sp, FG_SRAM_ESR_TIGHT_FILTER,
 		chip->dt.esr_tight_flt_upct, buf);
 	rc = fg_sram_write(chip, chip->sp[FG_SRAM_ESR_TIGHT_FILTER].addr_word,
@@ -4048,6 +4298,7 @@ static irqreturn_t fg_delta_batt_temp_irq_handler(int irq, void *data)
 	if (abs(chip->last_batt_temp - batt_temp) > 30)
 		pr_warn("Battery temperature last:%d current: %d\n",
 			chip->last_batt_temp, batt_temp);
+
 	return IRQ_HANDLED;
 }
 
@@ -4317,6 +4568,7 @@ static int fg_parse_slope_limit_coefficients(struct fg_chip *chip)
 		return rc;
 
 	for (i = 0; i < SLOPE_LIMIT_NUM_COEFFS; i++) {
+		pr_err("dt.slope_limit_coeffs[%d]=%d\n", i, chip->dt.slope_limit_coeffs[i]);
 		if (chip->dt.slope_limit_coeffs[i] > SLOPE_LIMIT_COEFF_MAX ||
 			chip->dt.slope_limit_coeffs[i] < 0) {
 			pr_err("Incorrect slope limit coefficient\n");
@@ -4410,6 +4662,8 @@ static int fg_parse_dt(struct fg_chip *chip)
 	u32 base, temp;
 	u8 subtype;
 	int rc;
+	bool b_ex_rsense= false; // FIHTDC, IdaChiang, add for DRG external sense issue
+	int ex_rsense = 0; // FIHTDC, IdaChiang, add for DRG external sense issue
 
 	if (!node)  {
 		dev_err(chip->dev, "device tree node missing\n");
@@ -4569,6 +4823,27 @@ static int fg_parse_dt(struct fg_chip *chip)
 	else
 		chip->dt.rsense_sel = (u8)temp & SOURCE_SELECT_MASK;
 
+// FIHTDC, IdaChiang, add for DRG external sense issue {{
+	chip->rsense_rw = 0;
+	b_ex_rsense = of_property_read_bool(node, "fih,check-external-rsense");
+	if (b_ex_rsense == true)
+	{
+		pr_err("FIH check externel rsense\n");
+		chip->rsense_rw = 1;
+		rc = of_property_read_u32(node, "fih,use-external-resense", &ex_rsense);
+		if (rc < 0)
+			pr_err("can't read fih,use-external-resense\n");
+		else
+		{
+			if(ex_rsense == 1)
+			{
+				pr_err("FIH set to use externel rsense\n");
+				chip->dt.rsense_sel = 1;
+			}
+		}
+	}
+// FIHTDC, IdaChiang, add for DRG external sense issue }}
+
 	chip->dt.jeita_thresholds[JEITA_COLD] = DEFAULT_BATT_TEMP_COLD;
 	chip->dt.jeita_thresholds[JEITA_COOL] = DEFAULT_BATT_TEMP_COOL;
 	chip->dt.jeita_thresholds[JEITA_WARM] = DEFAULT_BATT_TEMP_WARM;
@@ -4691,6 +4966,8 @@ static int fg_parse_dt(struct fg_chip *chip)
 	if (!rc)
 		chip->dt.rconn_mohms = temp;
 
+	pr_err("dt.rconn_mohms=%d\n", chip->dt.rconn_mohms);
+
 	rc = of_property_read_u32(node, "qcom,fg-esr-filter-switch-temp",
 			&temp);
 	if (rc < 0)
@@ -4711,6 +4988,8 @@ static int fg_parse_dt(struct fg_chip *chip)
 		chip->dt.esr_broad_flt_upct = DEFAULT_ESR_BROAD_FLT_UPCT;
 	else
 		chip->dt.esr_broad_flt_upct = temp;
+
+	pr_err("dt.esr_tight_flt_upct=%d dt.esr_broad_flt_upct=%d\n", chip->dt.esr_tight_flt_upct, chip->dt.esr_broad_flt_upct);
 
 	rc = of_property_read_u32(node, "qcom,fg-esr-tight-lt-filter-micro-pct",
 			&temp);
@@ -4942,6 +5221,9 @@ static int fg_gen3_probe(struct platform_device *pdev)
 			pr_err("Error in configuring ESR filter rc:%d\n", rc);
 	}
 
+	if(chip->rsense_rw == 1)
+		device_create_file(&pdev->dev, &dev_attr_rsense_sel); // FIHTDC, IdaChiang, add for DRG external sense issue
+
 	device_init_wakeup(chip->dev, true);
 	schedule_delayed_work(&chip->profile_load_work, 0);
 
@@ -4991,6 +5273,9 @@ static const struct dev_pm_ops fg_gen3_pm_ops = {
 static int fg_gen3_remove(struct platform_device *pdev)
 {
 	struct fg_chip *chip = dev_get_drvdata(&pdev->dev);
+
+	if(chip->rsense_rw == 1)
+		device_remove_file(&pdev->dev, &dev_attr_rsense_sel); // FIHTDC, IdaChiang, add for DRG external sense issue
 
 	fg_cleanup(chip);
 	return 0;

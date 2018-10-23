@@ -80,6 +80,15 @@
 #define SLOPE_LIMIT_COEFF_MAX		31
 
 #define BATT_THERM_NUM_COEFFS		3
+/* Bobihlee - C1N-667 - [BBS] Porting BBS log for battery and charging */
+#define BBS_LOG 1
+#ifdef BBS_LOG
+#define QPNPCHG_BATTERY_MISSING_ERROR do {printk("BBox;%s: Battery missing\n", __func__); printk("BBox::UEC;11::2\n");} while (0)
+#define QPNPFG_READ_ERROR	do {printk("BBox;%s: fg read failed\n", __func__); printk("BBox::UEC;12::2\n");} while (0)
+#define QPNPFG_WRITE_ERROR	do {printk("BBox;%s: fg write failed\n", __func__); printk("BBox::UEC;12::3\n");} while (0)
+#define QPNPFG_BATTERY_VOLTAGE_LOW do {printk("BBox;%s: Voltage low\n", __func__); printk("BBox::UEC;49::3\n");} while (0)
+#endif
+/* end C1N-667 */
 
 #define MAX_CC_STEPS			20
 
@@ -435,6 +444,7 @@ struct fg_chip {
 	bool			esr_flt_cold_temp_en;
 	bool			slope_limit_en;
 	bool			use_ima_single_mode;
+	bool 		rsense_rw; // FIHTDC, IdaChiang, add for DRG external sense issue
 	struct completion	soc_update;
 	struct completion	soc_ready;
 	struct delayed_work	profile_load_work;
@@ -500,4 +510,5 @@ extern void fg_circ_buf_clr(struct fg_circ_buf *);
 extern int fg_circ_buf_avg(struct fg_circ_buf *, int *);
 extern int fg_circ_buf_median(struct fg_circ_buf *, int *);
 extern int fg_lerp(const struct fg_pt *, size_t, s32, s32 *);
+extern int fg_dma_mem_req(struct fg_chip *, bool);
 #endif
