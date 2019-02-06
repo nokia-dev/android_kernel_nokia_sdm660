@@ -26,6 +26,7 @@
 #include <linux/delay.h>
 #include <linux/leds-qpnp-wled.h>
 #include <linux/qpnp/qpnp-revid.h>
+#include <linux/gpio.h>
 
 /* base addresses */
 #define QPNP_WLED_CTRL_BASE		"qpnp-wled-ctrl-base"
@@ -2301,7 +2302,14 @@ static int qpnp_wled_parse_dt(struct qpnp_wled *wled)
 	rc = of_property_read_u32(pdev->dev.of_node,
 			"qcom,fs-curr-ua", &temp_val);
 	if (!rc) {
-		wled->fs_curr_ua = temp_val;
+		//ZZDC sunqiupeng modify for set led current@20180126 start
+		if(strstr(saved_command_line, "androidboot.device=PL2") != NULL && gpio_get_value(12) != 0){
+			//It is PL2 HLT panel,set max led current as 15ma
+			wled->fs_curr_ua = 15000;
+		}else{
+			wled->fs_curr_ua = temp_val;
+		}
+		//ZZDC sunqiupeng modify for set led current@20180126 end
 	} else if (rc != -EINVAL) {
 		dev_err(&pdev->dev, "Unable to read full scale current\n");
 		return rc;

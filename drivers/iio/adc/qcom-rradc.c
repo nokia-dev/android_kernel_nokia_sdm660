@@ -764,7 +764,7 @@ static int rradc_check_status_ready_with_retry(struct rradc_chip *chip,
 static int rradc_read_channel_with_continuous_mode(struct rradc_chip *chip,
 			struct rradc_chan_prop *prop, u8 *buf)
 {
-	int rc = 0;
+	int rc = 0, ret = 0;
 	u16 status = 0;
 
 	rc = rradc_enable_continuous_mode(chip);
@@ -777,20 +777,21 @@ static int rradc_read_channel_with_continuous_mode(struct rradc_chip *chip,
 	rc = rradc_read(chip, status, buf, 1);
 	if (rc < 0) {
 		pr_err("status read failed:%d\n", rc);
-		return rc;
+		goto disable;
 	}
 
 	rc = rradc_check_status_ready_with_retry(chip, prop,
 						buf, status);
 	if (rc < 0) {
 		pr_err("Status read failed:%d\n", rc);
-		return rc;
+		goto disable;
 	}
 
-	rc = rradc_disable_continuous_mode(chip);
-	if (rc < 0) {
+disable:
+	ret = rradc_disable_continuous_mode(chip);
+	if (ret < 0) {
 		pr_err("Failed to switch to non continuous mode\n");
-		return rc;
+		return ret;
 	}
 
 	return rc;
